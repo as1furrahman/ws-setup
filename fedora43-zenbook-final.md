@@ -15,11 +15,11 @@ Follow each phase in order — every step builds on the previous one.
 | B | Fedora installation | Anaconda installer |
 | C | Btrfs subvolume architecture | From live USB, immediately after install |
 | D | First boot, update, firmware | First boot into installed system |
-| E | Kernel, sysctl, DNF, systemd | Post-update configuration |
-| F | Hardware synchronization | CPU, GPU, power, suspend, thermal |
-| G | OLED display optimization | Display pipeline tuning |
-| H | GNOME minimalism | Shell, Tracker, keybindings |
-| I | Development environment | Packages, Python, Go, Git, Podman, SSH, Ollama |
+| E | Kernel, sysctl, DNF, systemd, security hardening | Post-update configuration |
+| F | Hardware synchronization, power optimization | CPU, GPU, power, suspend, thermal |
+| G | OLED display optimization | Display pipeline, ABR, burn-in prevention |
+| H | GNOME minimalism | Shell, Tracker, keybindings, memory |
+| I | Development environment, toolchain managers | Packages, Python, Go, Git, Podman, SSH, Ollama |
 | J | Snapshot automation and tools | Scripts, timers, health dashboard |
 | K | Backup, baseline, maintenance | BorgBackup, perf-baseline, checklists |
 
@@ -198,7 +198,7 @@ UUID=$SWAP_UUID  none       swap   defaults                     0 0
 
 # Btrfs subvolumes (Samsung 990 Pro)
 UUID=$BTRFS_UUID /                    btrfs subvol=@,compress=zstd:1,noatime,ssd,discard=async,space_cache=v2,commit=120              0 0
-UUID=$BTRFS_UUID /home                btrfs subvol=@home,compress=zstd:1,noatime,ssd,discard=async,space_cache=v2,commit=120           0 0
+UUID=$BTRFS_UUID /home                btrfs subvol=@home,compress=zstd:1,noatime,ssd,discard=async,space_cache=v2,commit=120,autodefrag  0 0
 UUID=$BTRFS_UUID /.snapshots          btrfs subvol=@snapshots,compress=zstd:1,noatime,ssd,discard=async,space_cache=v2,commit=120      0 0
 UUID=$BTRFS_UUID /var/log             btrfs subvol=@var_log,compress=zstd:3,noatime,ssd,discard=async,space_cache=v2,commit=120        0 0
 UUID=$BTRFS_UUID /var/cache           btrfs subvol=@var_cache,compress=zstd:1,noatime,ssd,discard=async,space_cache=v2,commit=120      0 0
@@ -211,6 +211,8 @@ EOF
 **`commit=120`** — Btrfs metadata flush interval (default 30s). Batching to 120s reduces SSD write operations for bursty dev workloads. Tradeoff: up to 120s of uncommitted metadata on power loss — acceptable on a battery-backed laptop with NVMe power-loss protection. `@containers` omits it because `nodatacow` bypasses the journal.
 
 **`nofail`** on `@projects` — the user account `asif` is created by GNOME initial-setup during first boot. The `/home/asif` directory doesn't exist when systemd parses fstab, so this mount would fail and stall boot without `nofail`. Phase D.1 mounts it manually after user creation.
+
+**`autodefrag`** on `@home` — enables background defragmentation for small random writes. Improves performance for databases (SQLite, browser profiles) and dotfile-heavy workloads without manual intervention.
 
 ### C.4 Rebuild initramfs and Boot
 
@@ -238,6 +240,20 @@ sudo reboot
 ```
 
 Remove the USB drive. The system boots: GRUB → Fedora.
+
+### C.5 Btrfs Quotas
+
+Prevent any single subvolume from consuming all disk space (e.g., runaway container builds or log floods).
+
+```bash
+sudo btrfs quota enable /
+sudo btrfs qgroup limit 500G /                    # Root: 500 GiB max
+sudo btrfs qgroup limit 300G /home                 # Home: 300 GiB max
+sudo btrfs qgroup limit 50G /var/log               # Logs: 50 GiB cap
+sudo btrfs qgroup limit 100G /var/lib/containers   # Containers: 100 GiB
+```
+
+**Note:** Btrfs quotas add metadata overhead and can slow down heavy write workloads. Monitor with `btrfs qgroup show /`. Disable with `btrfs quota disable /` if performance degrades.
 
 ---
 
@@ -330,7 +346,7 @@ vainfo
 # Should list VAProfileH264Main, VAProfileHEVCMain, VAProfileAV1Profile0
 ```
 
-**Verify:** `vainfo` should list at least H264, HEVC, and AV1 profiles. Play a 4K YouTube video in Firefox — `htop` should show low CPU usage (under 20%) with GPU doing the decode work.
+**Verify:** `vainfo` should list at least H264, HEVC, and AV1 profiles. Play a 4K YouTube video in Firefox — `btop` should show low CPU usage (under 20%) with GPU doing the decode work.
 
 ### E.3 Kernel Parameters
 
@@ -358,7 +374,7 @@ sudo grubby --default-kernel --info | grep args    # Confirm params applied
 | `transparent_hugepage=madvise` | THP only for apps that opt in (NumPy, PyTorch) |
 | `nowatchdog nmi_watchdog=0` | Disable watchdog timers — saves power and CPU interrupts |
 | `workqueue.power_efficient=1` | Consolidate kernel work for deeper C-states on battery |
-| `pcie_aspm=default` | BIOS-validated PCIe link power management for NVMe and WiFi |
+| `pcie_aspm=default` | BIOS-validated PCIe link power management for NVMe and WiFi. *Overridden to `force` in F.14 for maximum power savings.* |
 | `mitigations=auto` | Keep CPU security mitigations at kernel defaults |
 | `resume=UUID=<SWAP_UUID>` | Swap partition for hibernation resume |
 
@@ -492,7 +508,7 @@ sudo systemctl disable --now pcscd.service pcscd.socket 2>/dev/null             
 
 # Verify critical services
 echo "=== System services ==="
-for svc in NetworkManager firewalld power-profiles-daemon fwupd \
+for svc in NetworkManager firewalld tuned fwupd \
            systemd-oomd systemd-resolved systemd-journald bluetooth; do
     printf "  %-28s %s\n" "$svc" "$(systemctl is-enabled $svc 2>/dev/null || echo 'NOT FOUND')"
 done
@@ -648,13 +664,209 @@ sudo grub2-mkconfig -o /boot/grub2/grub.cfg
 
 **After reboot:** the GRUB menu should appear briefly (2 seconds) in high resolution, then boot straight into Fedora with a smooth Plymouth spinner animation. Total boot time target: under 10 seconds to the login screen. Measure with `systemd-analyze` (covered in K.2).
 
+### E.14 SSH Hardening
+
+The guide opens SSH but doesn't harden the server configuration.
+
+```bash
+sudo tee /etc/ssh/sshd_config.d/hardened.conf << 'EOF'
+PasswordAuthentication no
+PermitRootLogin no
+PubkeyAuthentication yes
+AuthenticationMethods publickey
+MaxAuthTries 3
+MaxSessions 3
+ClientAliveInterval 300
+ClientAliveCountMax 2
+X11Forwarding no
+AllowAgentForwarding yes
+PermitEmptyPasswords no
+KbdInteractiveAuthentication no
+LoginGraceTime 30
+EOF
+
+sudo systemctl restart sshd
+```
+
+### E.15 fail2ban for SSH
+
+Automatically bans IPs after repeated failed login attempts.
+
+```bash
+sudo dnf install -y fail2ban
+
+sudo tee /etc/fail2ban/jail.local << 'EOF'
+[DEFAULT]
+bantime = 1h
+findtime = 10m
+maxretry = 3
+backend = systemd
+
+[sshd]
+enabled = true
+port = ssh
+EOF
+
+sudo systemctl enable --now fail2ban
+```
+
+**Verify:** `sudo fail2ban-client status sshd` should show the jail active with zero currently banned IPs.
+
+### E.16 Automatic Security Updates
+
+Apply security patches automatically between manual `safe-upgrade` cycles. Only security-classified updates are applied — no feature upgrades.
+
+```bash
+sudo dnf install -y dnf-automatic
+
+sudo tee /etc/dnf/automatic.conf << 'EOF'
+[commands]
+upgrade_type = security
+apply_updates = yes
+download_updates = yes
+
+[emitters]
+emit_via = stdio
+EOF
+
+sudo systemctl enable --now dnf-automatic-install.timer
+```
+
+**Verify:** `systemctl list-timers | grep dnf-automatic`
+
+### E.17 USBGuard
+
+Block unauthorized USB devices — prevents BadUSB-style attacks on a portable laptop. The initial policy whitelists all currently connected devices.
+
+```bash
+sudo dnf install -y usbguard
+sudo usbguard generate-policy > /etc/usbguard/rules.conf
+sudo systemctl enable --now usbguard
+```
+
+To allow a new device later: `sudo usbguard list-devices` then `sudo usbguard allow-device <id> --permanent`.
+
+### E.18 Additional sysctl Hardening
+
+Append network and kernel security parameters to the existing `90-zenbook.conf`.
+
+```bash
+sudo tee -a /etc/sysctl.d/90-zenbook.conf << 'EOF'
+
+# === Additional Security Hardening ===
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv6.conf.all.accept_source_route = 0
+net.ipv4.conf.all.log_martians = 1
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+kernel.yama.ptrace_scope = 2
+kernel.randomize_va_space = 2
+EOF
+
+sudo sysctl --system
+```
+
+| Parameter | Purpose |
+|---|---|
+| `rp_filter = 1` | Strict reverse path filtering — drops packets with spoofed source IPs |
+| `accept_redirects = 0` | Reject ICMP redirects (prevents MITM route injection) |
+| `send_redirects = 0` | Don't send ICMP redirects (not a router) |
+| `accept_source_route = 0` | Reject source-routed packets |
+| `log_martians = 1` | Log packets with impossible source addresses |
+| `yama.ptrace_scope = 2` | Restrict `ptrace` to root only (prevents process snooping) |
+| `randomize_va_space = 2` | Full ASLR — randomize stack, heap, and mmap |
+
+### E.19 Core Dump Restriction
+
+For maximum security, disable core dumps entirely to prevent credential leakage from process memory.
+
+```bash
+# Append to sysctl
+echo "fs.suid_dumpable = 0" | sudo tee -a /etc/sysctl.d/90-zenbook.conf
+sudo sysctl -p /etc/sysctl.d/90-zenbook.conf
+
+# Hard limit in PAM
+echo "* hard core 0" | sudo tee -a /etc/security/limits.conf
+```
+
+### E.20 DNSSEC Strict Mode
+
+Upgrade from `allow-downgrade` (set in E.5) to strict DNSSEC validation.
+
+```bash
+sudo sed -i 's/^DNSSEC=allow-downgrade/DNSSEC=yes/' /etc/systemd/resolved.conf.d/performance.conf
+sudo systemctl restart systemd-resolved
+```
+
+**Note:** Strict DNSSEC may cause failures on captive portals (hotel/airport WiFi). Temporarily switch back: `sudo sed -i 's/^DNSSEC=yes/DNSSEC=allow-downgrade/' /etc/systemd/resolved.conf.d/performance.conf && sudo systemctl restart systemd-resolved`.
+
+### E.21 Chrony NTP Hardening (NTS)
+
+Use Network Time Security — encrypted, authenticated NTP that prevents time-based attacks.
+
+```bash
+sudo tee /etc/chrony.conf.d/hardened.conf << 'EOF'
+# NTS (Network Time Security) — authenticated NTP
+server time.cloudflare.com iburst nts
+server nts.netnod.se iburst nts
+server ptbtime1.ptb.de iburst nts
+
+minsources 2
+maxchange 100 1 1
+makestep 1.0 3
+EOF
+
+sudo systemctl restart chronyd
+```
+
+**Verify:** `chronyc sources` should show NTS-authenticated sources with `#` flag.
+
+### E.22 Audit Rules for Sensitive Files
+
+Monitor changes to identity files, sudoers, and kernel module loading.
+
+```bash
+sudo tee /etc/audit/rules.d/sensitive.rules << 'EOF'
+-w /etc/passwd -p wa -k identity
+-w /etc/shadow -p wa -k identity
+-w /etc/group -p wa -k identity
+-w /etc/sudoers -p wa -k sudoers
+-w /etc/ssh/sshd_config -p wa -k sshd_config
+-w /sbin/insmod -p x -k kernel_modules
+-w /sbin/modprobe -p x -k kernel_modules
+EOF
+
+sudo augenrules --load
+```
+
+**Verify:** `sudo auditctl -l` should list all rules. Search audit logs: `sudo ausearch -k identity --start recent`.
+
+### E.23 Disable IPv6 (Optional)
+
+If you don't use IPv6, disabling it reduces attack surface.
+
+```bash
+sudo grubby --update-kernel=ALL --args="ipv6.disable=1"
+sudo reboot
+```
+
+**Note:** Skip this if you use IPv6 on your network. Some applications (e.g., Docker/Podman networking) may behave differently without IPv6 loopback.
+
 ---
 
 ## Phase F — Hardware-Software Synchronization
 
 ### F.1 Power Profiles
 
-`power-profiles-daemon` is the central orchestrator — it coordinates CPU, GPU, NVMe, WiFi, and fan behavior in a single command. Do not install TLP or auto-cpufreq alongside it; they will fight over the same sysfs knobs and create unpredictable behavior.
+`tuned-ppd` is Fedora 43's power management backend — it replaces the standalone `power-profiles-daemon` with a `tuned`-based implementation that exposes the same `powerprofilesctl` API. Do not install TLP or auto-cpufreq alongside it; they will fight over the same sysfs knobs and create unpredictable behavior.
 
 | Subsystem | Performance (AC) | Balanced (Battery) | Power Saver |
 |---|---|---|---|
@@ -793,7 +1005,7 @@ sudo udevadm control --reload-rules
 
 ### F.9 PowerTop
 
-PowerTop analyzes power consumption per device and process. Run it on battery for accurate readings — on AC, many power-saving features are intentionally disabled by `power-profiles-daemon`.
+PowerTop analyzes power consumption per device and process. Run it on battery for accurate readings — on AC, many power-saving features are intentionally disabled by `tuned-ppd`.
 
 ```bash
 sudo dnf install -y powertop
@@ -824,6 +1036,87 @@ stress-ng --cpu 16 --timeout 120 --metrics-brief
 ```
 
 If temperatures exceed 95°C or the laptop shuts down, verify BIOS thermal tables are current (Phase A.1) and that air vents are unobstructed. Elevating the laptop 1–2 cm with a stand improves cooling by 3–5°C under load.
+
+### F.11 GPU Power Cap
+
+Reduce heat and power draw from the Radeon 680M without visible performance loss.
+
+```bash
+# Check current GPU power cap (value in microwatts)
+cat /sys/class/drm/card0/device/hwmon/hwmon*/power1_cap
+
+# Set conservative 15W limit (default may be higher)
+echo 15000000 | sudo tee /sys/class/drm/card0/device/hwmon/hwmon*/power1_cap
+
+# Make persistent via udev
+sudo tee /etc/udev/rules.d/86-amdgpu-power.rules << 'EOF'
+ACTION=="add", SUBSYSTEM=="drm", KERNEL=="card0", RUN+="/bin/bash -c 'echo 15000000 > /sys/class/drm/card0/device/hwmon/hwmon*/power1_cap'"
+EOF
+```
+
+### F.12 NVMe I/O Scheduler
+
+NVMe drives have deep internal queues — the kernel's I/O scheduler adds overhead without benefit. Set to `none` for direct submission.
+
+```bash
+sudo tee /etc/udev/rules.d/60-io-scheduler.rules << 'EOF'
+ACTION=="add|change", KERNEL=="nvme[0-9]*", ATTR{queue/scheduler}="none"
+EOF
+
+sudo udevadm control --reload-rules
+```
+
+**Verify:** `cat /sys/block/nvme0n1/queue/scheduler` should show `[none]`.
+
+### F.13 Battery Charge Threshold
+
+Limiting charge to 80% dramatically extends Li-Po battery lifespan. ASUS laptops expose this via the kernel.
+
+```bash
+echo 80 | sudo tee /sys/class/power_supply/BAT0/charge_control_end_threshold
+
+# Make persistent via udev
+sudo tee /etc/udev/rules.d/87-battery-threshold.rules << 'EOF'
+ACTION=="add", SUBSYSTEM=="power_supply", ATTR{type}=="Battery", ATTR{charge_control_end_threshold}="80"
+EOF
+```
+
+Set to `100` before long trips. Use `60` if the laptop stays plugged in most of the time.
+
+### F.14 PCIe ASPM Force
+
+Force deeper PCIe link power states for maximum battery savings.
+
+```bash
+sudo grubby --update-kernel=ALL --args="pcie_aspm=force pcie_aspm.policy=powersupersave"
+sudo reboot
+```
+
+**Warning:** Test thoroughly after applying — some devices may become unstable. If WiFi drops or NVMe stalls, revert: `sudo grubby --update-kernel=ALL --remove-args="pcie_aspm pcie_aspm.policy" && sudo grubby --update-kernel=ALL --args="pcie_aspm=default"`.
+
+### F.15 Deep CPU Idle States
+
+Enable deeper C-states for better battery life on the Zen 3+ architecture.
+
+```bash
+sudo grubby --update-kernel=ALL --args="processor.max_cstate=9 amd_pstate.shared_mem=1"
+sudo reboot
+```
+
+### F.16 Fan Curve Control
+
+ASUS laptops may expose fan control via the `asus-nb-wmi` kernel module.
+
+```bash
+sudo modprobe asus_wmi
+ls /sys/devices/platform/asus-nb-wmi/
+
+# If hwmon is available:
+# echo 1 | sudo tee /sys/devices/platform/asus-nb-wmi/hwmon/hwmon*/pwm1_enable
+# echo 150 | sudo tee /sys/devices/platform/asus-nb-wmi/hwmon/hwmon*/pwm1  # 0-255 range
+```
+
+If no ASUS-specific interface is found, the firmware-controlled fan curve from the BIOS thermal profile (set in A.2) remains active.
 
 ---
 
@@ -860,6 +1153,34 @@ ELECTRON_OZONE_PLATFORM_HINT=auto   # Electron apps use Wayland natively
 QT_QPA_PLATFORM=wayland             # Qt apps use Wayland
 MOZ_ENABLE_WAYLAND=1                # Firefox Wayland
 ```
+
+### G.4 ABR and PSR Tuning
+
+Prevent OLED auto-dimming on dark content (ABR) and fix Panel Self-Refresh flicker.
+
+```bash
+# Disable PSR flicker
+sudo grubby --update-kernel=ALL --args="amdgpu.dcdebugmask=0x10"
+
+# Disable ABR (Automatic Brightness Regulation) if dimming is annoying
+sudo grubby --update-kernel=ALL --args="amdgpu.abmlevel=0"
+sudo reboot
+```
+
+**Verify after reboot:** Open a mostly-dark window — screen brightness should remain constant (no auto-dimming). Check `/proc/cmdline` for the new parameters.
+
+### G.5 OLED Burn-in Prevention
+
+GNOME doesn't natively support pixel shift, but aggressive screen blanking and sleep timers protect the panel.
+
+```bash
+# Auto-suspend on battery: 5 minutes
+gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-battery-timeout 300
+# Auto-suspend on AC: 15 minutes
+gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-timeout 900
+```
+
+Combined with the black backgrounds (H.2) and 3-minute idle screen blank (H.2), OLED pixels are protected during all idle periods.
 
 ---
 
@@ -949,7 +1270,7 @@ gsettings set org.gnome.settings-daemon.plugins.media-keys custom-keybindings \
 gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom0/ \
   name 'Terminal'
 gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom0/ \
-  command 'ptyxis'
+  command 'ghostty'
 gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom0/ \
   binding '<Super>Return'
 ```
@@ -957,6 +1278,24 @@ gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/or
 ### H.5 Extensions Policy
 
 Zero extensions. Only exception: `gnome-shell-extension-appindicator` from Fedora repos if needed.
+
+### H.6 GNOME Memory Optimization
+
+Limit GNOME Software background activity — it auto-downloads updates and metadata even when closed.
+
+```bash
+gsettings set org.gnome.software download-updates false
+gsettings set org.gnome.software download-updates-notify false
+```
+
+### H.7 Nautilus Performance
+
+```bash
+gsettings set org.gnome.nautilus.preferences show-hidden-files false
+gsettings set org.gnome.nautilus.preferences default-folder-viewer 'list-view'
+gsettings set org.gnome.nautilus.list-view default-zoom-level 'small'
+gsettings set org.gtk.Settings.FileChooser sort-directories-first true
+```
 
 ---
 
@@ -971,13 +1310,13 @@ sudo dnf install -y \
   gcc gcc-c++ gfortran make cmake ninja-build meson \
   clang llvm lld \
   python3-devel python3.12 python3.11 \
-  golang rust cargo \
+  golang rust cargo \                              # rust/cargo replaced by rustup in I.16
   openssl-devel libffi-devel zlib-devel bzip2-devel \
   readline-devel sqlite-devel xz-devel tk-devel \
   blas-devel lapack-devel openblas-devel hdf5-devel \
   git git-lfs git-delta \
   podman podman-compose buildah skopeo \
-  htop btop iotop-c powertop \
+  btop iotop-c powertop \
   tmux neovim \
   jq yq \
   ripgrep fd-find bat eza fzf \
@@ -1010,7 +1349,7 @@ flatpak override --user com.visualstudio.code \
 
 ```bash
 git config --global user.name "Asif"
-git config --global user.email "your-email@example.com"
+git config --global user.email "asif@zenbook"    # Replace with your actual email
 
 # Delta for syntax-highlighted diffs
 git config --global core.pager "delta"
@@ -1137,8 +1476,8 @@ Host *
     AddKeysToAgent yes
 
 Host gpu
-    HostName <gpu-server-ip>
-    User <username>
+    HostName 192.168.1.100              # Replace with your GPU server IP
+    User asif                            # Replace with your remote username
     ForwardAgent yes
     # LocalForward 8888 localhost:8888
     # LocalForward 6006 localhost:6006
@@ -1175,6 +1514,174 @@ sudo systemctl enable --now ollama
 # Verify
 systemctl is-active ollama && echo "✓ Ollama running" || echo "✗ Ollama failed to start"
 curl -s http://localhost:11434 | head -1
+```
+
+### I.9 zram Swap
+
+zram compresses swap in RAM — faster than NVMe and extends effective memory. Disk swap becomes overflow for hibernation only.
+
+```bash
+sudo dnf install -y zram-generator
+
+sudo tee /etc/systemd/zram-generator.conf << 'EOF'
+[zram0]
+zram-size = ram / 2
+compression-algorithm = zstd
+swap-priority = 100
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl start /dev/zram0
+```
+
+Lower disk swap priority so zram is used first — edit the swap line in `/etc/fstab`:
+
+```
+UUID=<SWAP_UUID>  none  swap  defaults,pri=10  0 0
+```
+
+**Verify:** `zramctl` should show a zram device. `swapon --show` should list zram at priority 100 and disk swap at priority 10.
+
+### I.10 Podman Lingering
+
+Allow rootless containers to keep running after logout — required for background dev databases, CI runners.
+
+```bash
+loginctl enable-linger asif
+```
+
+### I.11 Node.js via fnm
+
+`fnm` (Fast Node Manager) is missing from the base guide. It manages multiple Node.js versions without root.
+
+```bash
+curl -fsSL https://fnm.vercel.app/install | bash
+source ~/.bashrc
+fnm install --lts
+fnm default lts-latest
+node --version && npm --version
+```
+
+Add to `~/.bashrc` (after the fzf line):
+
+```bash
+eval "$(fnm env --use-on-cd --shell bash)"
+```
+
+### I.12 Podman-Docker CLI Compatibility
+
+Provides a `docker` command that transparently calls Podman — useful for scripts and tutorials written for Docker.
+
+```bash
+sudo dnf install -y podman-docker
+```
+
+### I.13 Neovim Configuration
+
+The guide installs `neovim` but doesn't configure it. Bootstrap with kickstart.nvim for a modern IDE-like experience:
+
+```bash
+git clone https://github.com/nvim-lua/kickstart.nvim.git ~/.config/nvim
+```
+
+### I.14 tmux Configuration
+
+```bash
+cat > ~/.tmux.conf << 'EOF'
+set -g default-terminal "tmux-256color"
+set -g history-limit 50000
+set -g mouse on
+set -g base-index 1
+setw -g pane-base-index 1
+set -g renumber-windows on
+set -g status-interval 5
+set -g focus-events on
+set -sg escape-time 10
+
+# Better prefix
+unbind C-b
+set -g prefix C-a
+bind C-a send-prefix
+
+# Intuitive splits
+bind | split-window -h -c "#{pane_current_path}"
+bind - split-window -v -c "#{pane_current_path}"
+EOF
+```
+
+### I.15 Python uv (Ultra-Fast Package Manager)
+
+`uv` is 10–100× faster than `pip` for installs and resolution. Drop-in replacement.
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+**Usage:** `uv venv .venv && source .venv/bin/activate && uv pip install -r requirements.txt`
+
+### I.16 Rust via rustup
+
+The guide installs `rust cargo` via DNF, but `rustup` is the upstream-recommended toolchain manager and supports multiple versions, components, and targets.
+
+```bash
+sudo dnf remove -y rust cargo 2>/dev/null    # Remove system packages
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source ~/.cargo/env
+rustup component add rust-analyzer clippy rustfmt
+```
+
+### I.17 Global .gitignore
+
+Prevent common junk files from ever being committed across all repositories.
+
+```bash
+mkdir -p ~/.config/git
+cat > ~/.config/git/ignore << 'EOF'
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.pyc
+__pycache__/
+.env
+.env.local
+node_modules/
+.venv/
+EOF
+
+git config --global core.excludesfile ~/.config/git/ignore
+```
+
+### I.18 Starship Prompt
+
+Replace the basic `PS1` prompt with Starship — a fast, context-aware prompt showing git status, Python venv, Node version, and more.
+
+```bash
+curl -sS https://starship.rs/install.sh | sh
+```
+
+Replace the `PS1=` line in `~/.bashrc` with:
+
+```bash
+eval "$(starship init bash)"
+```
+
+### I.19 Ghostty Terminal
+
+Ghostty is a fast, GPU-accelerated terminal emulator with native Wayland support.
+
+```bash
+sudo dnf copr enable -y pgdev/ghostty
+sudo dnf install -y ghostty
+```
+
+Set Ghostty as the default terminal (replaces Ptyxis in the Super+Return shortcut from H.4):
+
+```bash
+gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom0/ \
+  command 'ghostty'
 ```
 
 ---
@@ -1547,6 +2054,31 @@ sudo systemctl enable --now fstrim.timer
 sudo systemctl enable --now btrfs-scrub@-.timer
 ```
 
+### J.5 Pre-Snapshot Disk Space Check
+
+Add a free space gate to the `btrfs-snapshot` script. Insert after the `TS=` line in J.1:
+
+```bash
+# Add after TS=$(date +%Y%m%d-%H%M%S) in btrfs-snapshot:
+SPACE=$(btrfs filesystem usage / --raw 2>/dev/null | awk '/Free/{print $3; exit}')
+MIN_FREE=$((10 * 1024 * 1024 * 1024))  # 10 GiB minimum
+if [ "${SPACE:-0}" -lt "$MIN_FREE" ]; then
+    echo "  ✗ Less than 10 GiB free — run 'btrfs-snapshot clean' first"
+    exit 1
+fi
+```
+
+### J.6 Snapshot Desktop Notification
+
+Add a notification to the weekly timer service so you know snapshots completed. Edit the service unit:
+
+```bash
+sudo tee -a /etc/systemd/system/btrfs-snap-weekly.service << 'EOF'
+ExecStartPost=/usr/bin/notify-send -u low "Btrfs Snapshot" "Weekly coordinated snapshot complete"
+EOF
+sudo systemctl daemon-reload
+```
+
 ---
 
 ## Phase K — Backup, Baseline, and Maintenance
@@ -1643,6 +2175,15 @@ echo ""; echo "Scripts:"
 for s in btrfs-snapshot safe-upgrade system-health perf-baseline backup-borg; do
     [ -x "/usr/local/bin/$s" ] && echo "  ✓ $s" || echo "  ✗ $s missing or not executable"
 done
+
+echo ""; echo "Security hardening:"
+systemctl is-active fail2ban &>/dev/null && echo "  ✓ fail2ban" || echo "  ✗ fail2ban"
+systemctl is-active usbguard &>/dev/null && echo "  ✓ USBGuard" || echo "  ✗ USBGuard"
+swapon --show | grep -q zram && echo "  ✓ zram active" || echo "  ✗ zram missing"
+THRESH=$(cat /sys/class/power_supply/BAT0/charge_control_end_threshold 2>/dev/null)
+[ "$THRESH" = "80" ] && echo "  ✓ Battery threshold: 80%" || echo "  ⚠ Battery threshold: ${THRESH:-not set}"
+cat /sys/block/nvme0n1/queue/scheduler | grep -q '\[none\]' && echo "  ✓ NVMe scheduler: none" || echo "  ✗ NVMe scheduler not optimal"
+resolvectl status 2>/dev/null | grep -q DNSOverTLS && echo "  ✓ DNS-over-TLS active" || echo "  ⚠ DNS-over-TLS not confirmed"
 ```
 
 ### K.4 Monthly Maintenance
@@ -1670,14 +2211,113 @@ done
 7. sudo ausearch -m AVC --start this-month  # SELinux denials
 ```
 
+### K.6 Remote Backup Target
+
+BorgBackup to an external drive is great, but doesn't protect against theft or fire. Add a remote target:
+
+```bash
+# Option 1: BorgBase (managed Borg hosting, free tier available)
+# Option 2: rsync.net (supports Borg natively)
+# Option 3: Any SSH server with borg installed
+
+export BORG_REPO=ssh://user@backup-server/~/borg-zenbook
+borg init --encryption=repokey-blake2 $BORG_REPO
+```
+
+Use the same `backup-borg` script by adding a second `BORG_REPO` target, or create a separate `backup-borg-remote` script.
+
+### K.7 Flatpak Auto-Update Timer
+
+```bash
+sudo tee /etc/systemd/system/flatpak-update.service << 'EOF'
+[Unit]
+Description=Flatpak auto-update
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/flatpak update -y --noninteractive
+EOF
+
+sudo tee /etc/systemd/system/flatpak-update.timer << 'EOF'
+[Unit]
+Description=Weekly Flatpak update
+[Timer]
+OnCalendar=Wed *-*-* 04:00:00
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF
+
+sudo systemctl enable --now flatpak-update.timer
+```
+
+### K.8 SMART Monitoring
+
+Monitor NVMe health proactively — get warnings before drive failure.
+
+```bash
+sudo dnf install -y smartmontools
+sudo systemctl enable --now smartd
+
+# Check current health
+sudo smartctl -a /dev/nvme0n1 | grep -E "(Critical|Temperature|Available Spare|Percentage Used)"
+```
+
+### K.9 Automated Remote Backup Timer
+
+Automate the remote backup configured in K.6 with a weekly timer.
+
+```bash
+sudo tee /usr/local/bin/backup-borg-remote << 'SCRIPT'
+#!/bin/bash
+set -euo pipefail
+export BORG_REPO=ssh://user@backup-server/~/borg-zenbook   # Update with your remote target
+
+borg create --stats --compression zstd,3 \
+    "${BORG_REPO}::zenbook-$(date +%Y%m%d-%H%M%S)" \
+    /home/asif /etc \
+    --exclude '/home/asif/.cache' \
+    --exclude '/home/asif/.local/share/containers' \
+    --exclude '/home/asif/projects/*/.venv' \
+    --exclude '/home/asif/projects/*/node_modules' \
+    --exclude '*.pyc' --exclude '__pycache__'
+
+borg prune --stats --keep-daily 7 --keep-weekly 4 --keep-monthly 6 "$BORG_REPO"
+borg compact "$BORG_REPO"
+SCRIPT
+
+sudo chmod +x /usr/local/bin/backup-borg-remote
+
+sudo tee /etc/systemd/system/backup-borg-remote.service << 'EOF'
+[Unit]
+Description=Weekly remote BorgBackup
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/backup-borg-remote
+EOF
+
+sudo tee /etc/systemd/system/backup-borg-remote.timer << 'EOF'
+[Unit]
+Description=Weekly remote backup
+[Timer]
+OnCalendar=Sat *-*-* 02:00:00
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF
+
+sudo systemctl enable --now backup-borg-remote.timer
+```
+
 ---
 
 ## Appendix — Configuration Reference
 
 ### Kernel Command Line
-
+ 
 ```
-amd_pstate=active amd_iommu=on iommu=pt transparent_hugepage=madvise nowatchdog nmi_watchdog=0 workqueue.power_efficient=1 pcie_aspm=default mitigations=auto resume=UUID=<SWAP_UUID>
+amd_pstate=active amd_iommu=on iommu=pt transparent_hugepage=madvise nowatchdog nmi_watchdog=0 workqueue.power_efficient=1 pcie_aspm=force pcie_aspm.policy=powersupersave mitigations=auto resume=UUID=<SWAP_UUID> processor.max_cstate=9 amd_pstate.shared_mem=1 amdgpu.dcdebugmask=0x10 amdgpu.abmlevel=0
 ```
 
 ### /etc/sysctl.d/90-zenbook.conf
@@ -1704,6 +2344,22 @@ kernel.panic = 10
 kernel.dmesg_restrict = 1
 kernel.unprivileged_bpf_disabled = 1
 kernel.kptr_restrict = 1
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv6.conf.all.accept_source_route = 0
+net.ipv4.conf.all.log_martians = 1
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+kernel.yama.ptrace_scope = 2
+kernel.randomize_va_space = 2
+fs.suid_dumpable = 0
 fs.inotify.max_user_watches = 524288
 fs.inotify.max_user_instances = 1024
 ```
@@ -1713,6 +2369,7 @@ fs.inotify.max_user_instances = 1024
 | Type | Options |
 |---|---|
 | Standard | `compress=zstd:1,noatime,ssd,discard=async,space_cache=v2,commit=120` |
+| Home | `compress=zstd:1,noatime,ssd,discard=async,space_cache=v2,commit=120,autodefrag` |
 | Logs | `compress=zstd:3,noatime,ssd,discard=async,space_cache=v2,commit=120` |
 | Containers | `nodatacow,noatime,ssd,discard=async,space_cache=v2` |
 
@@ -1725,6 +2382,7 @@ fs.inotify.max_user_instances = 1024
 | `system-health` | Color-coded system health dashboard |
 | `perf-baseline` | Performance benchmark |
 | `backup-borg` | BorgBackup to external drive |
+| `backup-borg-remote` | BorgBackup to remote SSH server |
 
 ### Active Timers
 
@@ -1734,6 +2392,9 @@ fs.inotify.max_user_instances = 1024
 | `btrfs-scrub@-.timer` | Monthly | Data integrity |
 | `btrfs-snap-weekly.timer` | Sunday 3 AM | Coordinated snapshot (root + home + projects) |
 | `btrfs-snap-clean.timer` | 1st of month | Snapshot cleanup |
+| `flatpak-update.timer` | Wednesday 4 AM | Flatpak application updates |
+| `dnf-automatic-install.timer` | Daily | Automatic security patches |
+| `backup-borg-remote.timer` | Saturday 2 AM | Remote BorgBackup |
 
 ---
 
