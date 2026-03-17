@@ -1072,16 +1072,51 @@ sudo udevadm control --reload-rules
 
 Limiting charge to 80% dramatically extends Li-Po battery lifespan. ASUS laptops expose this via the kernel.
 
+Set the threshold immediately:
+
 ```bash
 echo 80 | sudo tee /sys/class/power_supply/BAT0/charge_control_end_threshold
+```
 
-# Make persistent via udev
+**Making it permanent:** On ASUS laptops, the udev `ACTION=="add"` rule fires before the `asus-nb-wmi` module exposes `charge_control_end_threshold`, so the threshold resets to 100% after every reboot. The reliable fix is a systemd service:
+
+```bash
+sudo tee /etc/systemd/system/battery-charge-threshold.service << 'EOF'
+[Unit]
+Description=Set battery charge threshold
+After=multi-user.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+Restart=on-failure
+RestartSec=5
+ExecStart=/bin/bash -c 'echo 80 > /sys/class/power_supply/BAT0/charge_control_end_threshold'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable battery-charge-threshold.service
+```
+
+The udev rule is kept as a fallback for AC plug/unplug events:
+
+```bash
 sudo tee /etc/udev/rules.d/87-battery-threshold.rules << 'EOF'
-ACTION=="add", SUBSYSTEM=="power_supply", ATTR{type}=="Battery", ATTR{charge_control_end_threshold}="80"
+ACTION=="change", SUBSYSTEM=="power_supply", ATTR{type}=="Battery", ATTR{charge_control_end_threshold}="80"
 EOF
 ```
 
 Set to `100` before long trips. Use `60` if the laptop stays plugged in most of the time.
+
+Verify after reboot:
+
+```bash
+cat /sys/class/power_supply/BAT0/charge_control_end_threshold
+# Expected: 80
+```
 
 ### F.14 PCIe ASPM Force
 

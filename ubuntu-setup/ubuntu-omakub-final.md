@@ -302,7 +302,65 @@ sudo aa-status
 # Expected: apparmor module is loaded, profiles in enforce mode
 ```
 
-**Never disable AppArmor.** If a tool is blocked, create a targeted profile adjustment rather than disabling enforcement.
+**Never disable AppArmor.** If a tool is blocked, follow the denial handling workflow below rather than disabling enforcement.
+
+### D.2.1 AppArmor Denial Handling Workflow
+
+When AppArmor blocks a legitimate application (new binaries, custom scripts, Ollama, Docker, etc.), follow this workflow:
+
+**1. Identify the denial:**
+
+```bash
+journalctl -k | grep DENIED
+# or
+sudo dmesg | grep apparmor.*DENIED
+```
+
+**2. Review current profiles and modes:**
+
+```bash
+sudo aa-status
+```
+
+**3. Switch the offending profile to learning (complain) mode** to gather needed permissions without blocking:
+
+```bash
+sudo apt install -y apparmor-utils
+sudo aa-complain /path/to/profile
+# Use the application normally — AppArmor logs what would be denied but allows it
+```
+
+**4. Interactively review and approve the collected actions:**
+
+```bash
+sudo aa-logprof
+# Review each action: (A)llow, (D)eny, (I)gnore, (G)lob, etc.
+```
+
+**5. Re-enforce the updated profile:**
+
+```bash
+sudo aa-enforce /path/to/profile
+```
+
+**6. For entirely new binaries with no existing profile:**
+
+```bash
+sudo aa-genprof /path/to/binary
+# Run the binary in another terminal while aa-genprof watches
+# Press (S) to scan for events, then (F) to finish
+```
+
+**Quick reference:**
+
+| Command | Purpose |
+|---|---|
+| `sudo aa-status` | List all profiles and their modes |
+| `journalctl -k \| grep DENIED` | Find AppArmor denials |
+| `sudo aa-logprof` | Interactive review of logged denials |
+| `sudo aa-genprof /path` | Generate a new profile for a binary |
+| `sudo aa-complain /path` | Switch profile to learning mode |
+| `sudo aa-enforce /path` | Switch profile back to enforce mode |
 
 ### D.3 Full System Update
 
@@ -443,6 +501,13 @@ sudo systemctl disable --now cups-browsed.service 2>/dev/null || true
 sudo systemctl mask ModemManager.service 2>/dev/null || true
 sudo systemctl disable --now avahi-daemon.service avahi-daemon.socket 2>/dev/null || true
 sudo systemctl mask remote-fs.target 2>/dev/null || true
+
+# Disable Ubuntu crash reporter (sends telemetry, wastes CPU on core dumps)
+sudo systemctl disable --now apport.service 2>/dev/null || true
+sudo systemctl mask apport.service
+
+# Disable smart card daemon (unused on this hardware)
+sudo systemctl disable --now pcscd.service pcscd.socket 2>/dev/null || true
 ```
 
 ### E.8 systemd-oomd Tuning
@@ -516,6 +581,12 @@ EOF
 SWAP_UUID=$(blkid -t TYPE=swap -s UUID -o value | head -1)
 sudo sed -i "s/SWAP_UUID_PLACEHOLDER/$SWAP_UUID/" /etc/initramfs-tools/conf.d/performance.conf
 
+# Include only modules needed by this hardware (faster boot)
+sudo sed -i 's/^MODULES=most/MODULES=dep/' /etc/initramfs-tools/initramfs.conf
+
+# Explicitly include btrfs (not always auto-detected with MODULES=dep)
+grep -qxF 'btrfs' /etc/initramfs-tools/modules || echo 'btrfs' | sudo tee -a /etc/initramfs-tools/modules
+
 sudo update-initramfs -u -k all
 ```
 
@@ -523,7 +594,6 @@ sudo update-initramfs -u -k all
 
 ```bash
 sudo sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=2/' /etc/default/grub
-sudo sed -i 's/^GRUB_TERMINAL_OUTPUT=.*/GRUB_TERMINAL_OUTPUT="gfxterm"/' /etc/default/grub 2>/dev/null || true
 sudo update-grub
 ```
 
@@ -673,6 +743,34 @@ sudo update-grub
 sudo reboot
 ```
 
+### E.22 USBGuard
+
+Block unauthorized USB devices at the kernel level. Prevents BadUSB attacks when plugging into untrusted ports (cafes, airports, coworking spaces).
+
+```bash
+sudo apt install -y usbguard
+sudo usbguard generate-policy > /etc/usbguard/rules.conf
+sudo systemctl enable --now usbguard
+```
+
+Verify currently allowed devices:
+
+```bash
+sudo usbguard list-devices
+sudo usbguard list-rules
+```
+
+**When a legitimate new device is blocked:** plug it in, then:
+
+```bash
+sudo usbguard list-devices
+# Find the blocked device (status: block)
+sudo usbguard allow-device <ID> -p
+# -p makes the rule permanent (appends to rules.conf)
+```
+
+**Warning:** Generate the initial policy with your keyboard, mouse, and any other daily-use USB devices already connected. If USBGuard blocks your keyboard on reboot, you will need to boot a live USB to fix `/etc/usbguard/rules.conf`.
+
 ---
 
 ## Phase F — Hardware-Software Synchronization
@@ -788,12 +886,57 @@ sudo udevadm control --reload-rules
 
 ### F.11 Battery Charge Threshold
 
+Set the threshold immediately:
+
 ```bash
 echo 80 | sudo tee /sys/class/power_supply/BAT0/charge_control_end_threshold
+```
 
-sudo tee /etc/udev/rules.d/87-battery-threshold.rules << 'EOF'
-ACTION=="add", SUBSYSTEM=="power_supply", ATTR{type}=="Battery", ATTR{charge_control_end_threshold}="80"
+**Making it permanent:** On ASUS laptops, the udev `ACTION=="add"` rule fires before the `asus-nb-wmi` module exposes `charge_control_end_threshold`, so the threshold resets to 100% after every reboot. The reliable fix is a systemd service that waits for the sysfs attribute to exist:
+
+```bash
+sudo tee /etc/systemd/system/battery-charge-threshold.service << 'EOF'
+[Unit]
+Description=Set battery charge threshold
+After=multi-user.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+Restart=on-failure
+RestartSec=5
+ExecStart=/bin/bash -c 'echo 80 > /sys/class/power_supply/BAT0/charge_control_end_threshold'
+
+[Install]
+WantedBy=multi-user.target
 EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable battery-charge-threshold.service
+```
+
+The udev rule is kept as a belt-and-suspenders fallback for AC plug/unplug events:
+
+```bash
+sudo tee /etc/udev/rules.d/87-battery-threshold.rules << 'EOF'
+ACTION=="change", SUBSYSTEM=="power_supply", ATTR{type}=="Battery", ATTR{charge_control_end_threshold}="80"
+EOF
+```
+
+**Note:** The udev rule now uses `ACTION=="change"` instead of `ACTION=="add"` -- this fires when the power supply state changes (e.g. plugging/unplugging AC), which is more reliable than the one-time `add` event at boot.
+
+Set to `100` before long trips. Use `60` if the laptop stays plugged in most of the time. To change:
+
+```bash
+echo <VALUE> | sudo tee /sys/class/power_supply/BAT0/charge_control_end_threshold
+# Then update the service and udev rule to match
+```
+
+Verify after reboot:
+
+```bash
+cat /sys/class/power_supply/BAT0/charge_control_end_threshold
+# Expected: 80
 ```
 
 ### F.12 PCIe ASPM Force
@@ -811,6 +954,52 @@ sudo update-grub
 CURRENT=$(grep GRUB_CMDLINE_LINUX_DEFAULT /etc/default/grub | head -1)
 sudo sed -i "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|${CURRENT%\"} processor.max_cstate=9 amd_pstate.shared_mem=1\"|" /etc/default/grub
 sudo update-grub
+```
+
+### F.14 Thermal Baseline
+
+Establish expected thermal behavior under idle and load. Run these after completing all other Phase F tuning.
+
+**Detect sensors:**
+
+```bash
+sudo sensors-detect --auto
+sensors
+```
+
+**Idle baseline** (expected 35-45C on Zenbook S 13):
+
+```bash
+watch -n 2 sensors
+```
+
+**Stress test** (expected 80-85C sustained, 3.0-3.5 GHz):
+
+```bash
+stress-ng --cpu 16 --timeout 120 &
+watch -n 2 'sensors; echo "---"; grep MHz /proc/cpuinfo | sort -u'
+```
+
+**Fan control sysfs interface** (ASUS Zenbook):
+
+The `asus-nb-wmi` kernel module exposes fan control at:
+
+```
+/sys/devices/platform/asus-nb-wmi/hwmon/hwmon*/pwm1_enable
+  0 = full speed
+  1 = manual
+  2 = automatic (default, recommended)
+
+/sys/devices/platform/asus-nb-wmi/hwmon/hwmon*/pwm1
+  0-255 = fan speed (only effective when pwm1_enable=1)
+```
+
+Leave `pwm1_enable=2` (automatic) unless you have a specific reason. Document your measured baselines in a local file for future comparison:
+
+```bash
+echo "=== Thermal Baseline $(date +%Y-%m-%d) ===" | sudo tee -a /var/log/thermal-baseline.log
+echo "Idle: $(sensors | grep -i tctl | head -1)" | sudo tee -a /var/log/thermal-baseline.log
+echo "Load: run stress-ng --cpu 16 --timeout 120 and observe" | sudo tee -a /var/log/thermal-baseline.log
 ```
 
 ---
@@ -879,6 +1068,20 @@ gsettings set org.gnome.desktop.privacy report-technical-problems false
 gsettings set org.gnome.desktop.privacy recent-files-max-age 7
 gsettings set org.gnome.desktop.privacy remove-old-temp-files true
 gsettings set org.gnome.desktop.privacy old-files-age 7
+
+# Hot corners, idle, lock
+gsettings set org.gnome.desktop.interface enable-hot-corners false
+gsettings set org.gnome.desktop.session idle-delay 180
+gsettings set org.gnome.desktop.screensaver lock-enabled true
+gsettings set org.gnome.desktop.screensaver lock-delay 0
+
+# Disable GNOME Software auto-download (conflicts with safe-upgrade workflow)
+gsettings set org.gnome.software download-updates false
+gsettings set org.gnome.software download-updates-notify false
+
+# Disable unnecessary search providers (saves memory and CPU)
+gsettings set org.gnome.desktop.search-providers disabled \
+  "['org.gnome.Software.desktop', 'org.gnome.Characters.desktop', 'org.gnome.clocks.desktop', 'org.gnome.Photos.desktop']"
 ```
 
 ### G.6 Tracker3 Indexing
@@ -891,6 +1094,11 @@ gsettings set org.freedesktop.Tracker3.Miner.Files index-recursive-directories \
 gsettings set org.freedesktop.Tracker3.Miner.Files index-on-battery false
 gsettings set org.freedesktop.Tracker3.Miner.Files index-removable-devices false
 gsettings set org.freedesktop.Tracker3.Miner.Files crawling-interval -1
+
+# Content-based directory ignore list (prevents crawling into build artifacts)
+gsettings set org.freedesktop.Tracker3.Miner.Files \
+  ignored-directories-with-content \
+  "['node_modules', '.venv', '__pycache__', '.git', '.cargo', 'target', '.tox', '.mypy_cache', '.pytest_cache', 'dist', 'build']"
 
 touch ~/projects/.trackerignore
 ```
@@ -927,6 +1135,7 @@ sudo apt install -y \
   btop iotop powertop \
   tmux \
   jq \
+  fd-find \
   shellcheck strace linux-tools-common linux-tools-generic stress-ng \
   lm-sensors nvme-cli smartmontools \
   btrfs-progs compsize \
@@ -934,6 +1143,14 @@ sudo apt install -y \
   wl-clipboard \
   auditd \
   borgbackup
+```
+
+Install `yq` (YAML processor -- the Go version from GitHub, not the snap which is a different tool):
+
+```bash
+YQ_VER=$(curl -s https://api.github.com/repos/mikefarah/yq/releases/latest | grep tag_name | cut -d '"' -f 4)
+sudo wget -qO /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/${YQ_VER}/yq_linux_amd64"
+sudo chmod +x /usr/local/bin/yq
 ```
 
 ### H.2 Git Configuration Additions
@@ -1087,10 +1304,19 @@ export ELECTRON_OZONE_PLATFORM_HINT=auto
 export QT_QPA_PLATFORM=wayland
 export MOZ_ENABLE_WAYLAND=1
 
+export GOPATH="$HOME/go"
+export GOBIN="$HOME/go/bin"
+export PATH="$GOBIN:$PATH"
+
 alias upgrade='sudo /usr/local/bin/safe-upgrade'
 alias health='sudo /usr/local/bin/system-health'
 alias snap='sudo /usr/local/bin/btrfs-snapshot'
 alias top='btop'
+alias cat='bat --plain'
+alias grep='rg'
+alias find='fdfind'
+alias ll='eza -la --group-directories-first --git'
+alias ls='eza --group-directories-first'
 # --- End Ubuntu 24.04 Post-Install ---
 BASHRC
 ```
@@ -1215,7 +1441,32 @@ case "${1:-help}" in
     verify) echo "Health check..."; check_health && echo "Healthy" || { echo "Failed"; exit 1; } ;;
     list) for d in root home projects; do [ -d "$SNAP_ROOT/$d" ] || continue; echo "$d:"; ls -1 "$SNAP_ROOT/$d/"; done ;;
     clean) keep=${2:-$MAX}; for d in root home projects; do dir="$SNAP_ROOT/$d"; [ -d "$dir" ] || continue; count=$(find "$dir" -maxdepth 1 -mindepth 1 -type d | wc -l); if [ "$count" -gt "$keep" ]; then find "$dir" -maxdepth 1 -mindepth 1 -type d | sort | head -n $((count-keep)) | while read -r s; do btrfs subvolume delete "$s" >/dev/null; echo "  Deleted: $(basename "$s")"; done; fi; done ;;
-    rollback) echo "Boot Ubuntu Live USB, mount subvolid=5, restore from /.snapshots/"; last_verified && echo "Last verified: $(last_verified)" ;;
+    rollback)
+        echo "=== Btrfs Rollback Procedure ==="
+        echo ""
+        echo "1. Boot Ubuntu 24.04 Live USB"
+        echo "2. Open a terminal and become root:"
+        echo "   sudo -i"
+        echo "3. Mount the top-level Btrfs volume:"
+        echo "   mount -o subvolid=5 /dev/nvme0n1p4 /mnt"
+        echo "4. Move the broken subvolume aside:"
+        echo "   cd /mnt"
+        echo "   mv @ @.broken-\$(date +%Y%m%d)"
+        echo "5. Restore from snapshot (pick one from /.snapshots/root/):"
+        echo "   btrfs subvolume snapshot .snapshots/root/<SNAPSHOT> @"
+        echo "6. Repeat for @home and @projects if needed:"
+        echo "   mv @home @home.broken-\$(date +%Y%m%d)"
+        echo "   btrfs subvolume snapshot .snapshots/home/<SNAPSHOT> @home"
+        echo "7. Unmount and reboot:"
+        echo "   cd / && umount /mnt && reboot"
+        echo ""
+        echo "Available snapshots:"
+        for d in root home projects; do
+            [ -d "$SNAP_ROOT/$d" ] || continue
+            echo "  $d:"; ls -1 "$SNAP_ROOT/$d/" 2>/dev/null | tail -5 | sed 's/^/    /'
+        done
+        last_verified && echo "" && echo "Last verified group: $(last_verified)"
+        ;;
     *) echo "Usage: btrfs-snapshot {pre-upgrade|group|verify|list|clean|rollback}" ;;
 esac
 SCRIPT
@@ -1250,49 +1501,64 @@ sudo tee /usr/local/bin/system-health << 'SCRIPT'
 #!/bin/bash
 set -euo pipefail
 
+GRN='\033[0;32m'; RED='\033[0;31m'; YLW='\033[0;33m'
+BLD='\033[1m'; DIM='\033[2m'; RST='\033[0m'
+
+ok()   { echo -e "  ${GRN}✓${RST} $*"; }
+err()  { echo -e "  ${RED}✗${RST} $*"; }
+warn() { echo -e "  ${YLW}!${RST} $*"; }
+hdr()  { echo -e "\n${BLD}$*${RST}"; }
+
 echo ""
-echo "============================================"
-echo "  System Health · $(date '+%Y-%m-%d %H:%M')"
-echo "============================================"
+echo -e "${BLD}============================================${RST}"
+echo -e "${BLD}  System Health · $(date '+%Y-%m-%d %H:%M')${RST}"
+echo -e "${BLD}============================================${RST}"
 
-echo ""; echo "Kernel & Boot"
-echo "  Kernel: $(uname -r) · Uptime: $(uptime -p)"
+hdr "Kernel & Boot"
+echo -e "  Kernel: $(uname -r) · Uptime: $(uptime -p)"
 FAILED=$(systemctl --failed --no-pager --no-legend | wc -l)
-[ "$FAILED" -eq 0 ] && echo "  [OK] No failed services" || echo "  [!!] $FAILED failed"
+[ "$FAILED" -eq 0 ] && ok "No failed services" || err "$FAILED failed service(s)"
 AA=$(aa-status 2>/dev/null | head -1 || echo "unknown")
-echo "  AppArmor: $AA"
+echo -e "  AppArmor: $AA"
 
-echo ""; echo "CPU & Thermal"
-echo "  Driver: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_driver 2>/dev/null) · EPP: $(cat /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference 2>/dev/null) · Profile: $(powerprofilesctl get 2>/dev/null)"
+hdr "CPU & Thermal"
+echo -e "  Driver: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_driver 2>/dev/null) · EPP: $(cat /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference 2>/dev/null) · Profile: $(powerprofilesctl get 2>/dev/null)"
 if command -v sensors &>/dev/null; then
     T=$(sensors 2>/dev/null | grep -iE "tctl|tdie" | head -1 | sed -n 's/.*+\([0-9]*\)\..*/\1/p')
-    [ -n "$T" ] && echo "  CPU Temp: ${T}C"
+    if [ -n "$T" ]; then
+        [ "$T" -lt 80 ] && ok "CPU Temp: ${T}C" || warn "CPU Temp: ${T}C (high)"
+    fi
 fi
 
-echo ""; echo "Memory"
-echo "  $(free -h | awk '/Mem:/{printf "RAM: %s/%s (%s available)", $3, $2, $7}')"
+hdr "Memory"
+echo -e "  $(free -h | awk '/Mem:/{printf "RAM: %s/%s (%s available)", $3, $2, $7}')"
 
-echo ""; echo "Storage"
-echo "  Root: $(df -h / | awk 'NR==2{print $5, "used,", $4, "free"}')"
+hdr "Storage"
+echo -e "  Root: $(df -h / | awk 'NR==2{print $5, "used,", $4, "free"}')"
 if command -v nvme &>/dev/null; then
     WEAR=$(sudo nvme smart-log /dev/nvme0n1 2>/dev/null | awk '/percentage_used/{print $3}' | tr -d '%')
-    [ -n "$WEAR" ] && echo "  SSD wear: ${WEAR}%"
+    if [ -n "$WEAR" ]; then
+        [ "$WEAR" -lt 80 ] && ok "SSD wear: ${WEAR}%" || warn "SSD wear: ${WEAR}% (consider replacement)"
+    fi
 fi
 BERR=$(btrfs device stats / 2>/dev/null | grep -v ' 0$' | wc -l)
-[ "$BERR" -eq 0 ] && echo "  [OK] Btrfs: clean" || echo "  [!!] Btrfs: $BERR error(s)"
+[ "$BERR" -eq 0 ] && ok "Btrfs: clean" || err "Btrfs: $BERR error(s)"
 
 BAT=$(cat /sys/class/power_supply/BAT*/capacity 2>/dev/null | head -1)
 BSTAT=$(cat /sys/class/power_supply/BAT*/status 2>/dev/null | head -1)
-[ -n "$BAT" ] && { echo ""; echo "Battery"; echo "  ${BAT}% ($BSTAT)"; }
+if [ -n "$BAT" ]; then
+    hdr "Battery"
+    [ "$BAT" -gt 20 ] && ok "${BAT}% ($BSTAT)" || warn "${BAT}% ($BSTAT) — low"
+fi
 
-echo ""; echo "Snapshots"
+hdr "Snapshots"
 for d in root home projects; do
     [ -d "/.snapshots/$d" ] || continue
     C=$(find "/.snapshots/$d" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l)
     L=$(find "/.snapshots/$d" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort | tail -1 | xargs -r basename 2>/dev/null)
-    echo "  $d: $C snapshot(s)${L:+, latest: $L}"
+    ok "$d: $C snapshot(s)${L:+, latest: $L}"
 done
-echo ""; echo "============================================"; echo ""
+echo -e "\n${BLD}============================================${RST}\n"
 SCRIPT
 sudo chmod +x /usr/local/bin/system-health
 ```
@@ -1343,6 +1609,56 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now btrfs-snap-weekly.timer btrfs-snap-clean.timer
 sudo systemctl enable --now fstrim.timer
 sudo systemctl enable --now btrfs-scrub@-.timer 2>/dev/null || true
+```
+
+### I.5 Systemd Failure Alerting
+
+Silent failures are invisible failures. If `fail2ban`, `smartd`, `btrfs-scrub`, or `chronyd` crash, this template service delivers a desktop notification and logs the event.
+
+```bash
+sudo tee /etc/systemd/system/notify-failure@.service << 'EOF'
+[Unit]
+Description=Service failure notification for %i
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/notify-failure %i
+EOF
+```
+
+```bash
+sudo tee /usr/local/bin/notify-failure << 'SCRIPT'
+#!/bin/bash
+UNIT="${1:-unknown}"
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+MSG="FAILED: $UNIT at $TIMESTAMP"
+
+echo "$MSG" >> /var/log/service-failures.log
+
+REAL_USER=$(logname 2>/dev/null || echo "${SUDO_USER:-}")
+if [ -n "$REAL_USER" ]; then
+    UID_NUM=$(id -u "$REAL_USER")
+    sudo -u "$REAL_USER" \
+        DISPLAY=:0 \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${UID_NUM}/bus" \
+        notify-send -u critical "Service Failed" "$UNIT has failed. Check: journalctl -u $UNIT" 2>/dev/null || true
+fi
+SCRIPT
+sudo chmod +x /usr/local/bin/notify-failure
+sudo touch /var/log/service-failures.log
+```
+
+Wire into critical services by adding an override:
+
+```bash
+for unit in fail2ban smartd btrfs-scrub@-.timer chronyd sshd usbguard; do
+    if systemctl cat "$unit" &>/dev/null; then
+        sudo mkdir -p "/etc/systemd/system/${unit}.d"
+        printf '[Unit]\nOnFailure=notify-failure@%%n.service\n' | \
+            sudo tee "/etc/systemd/system/${unit}.d/failure-alert.conf" >/dev/null
+    fi
+done
+sudo systemctl daemon-reload
 ```
 
 ---
@@ -1424,7 +1740,7 @@ echo ""; echo "Timers:"
 systemctl list-timers --no-pager | grep -E "fstrim|btrfs|snap" | awk '{printf "  %s\n", $NF}'
 
 echo ""; echo "Scripts:"
-for s in btrfs-snapshot safe-upgrade system-health perf-baseline backup-borg; do
+for s in btrfs-snapshot safe-upgrade system-health perf-baseline notify-failure backup-borg backup-borg-remote; do
     [ -x "/usr/local/bin/$s" ] && echo "  [OK] $s" || echo "  [!!] $s missing or not executable"
 done
 
@@ -1472,7 +1788,7 @@ done
 3. Test suspend/resume after kernel updates
 4. sudo perf-baseline                     # Compare against initial
 5. borg check $BORG_REPO                  # Backup integrity
-6. sudo ausearch -m AVC --start this-month # AppArmor denials
+6. sudo ausearch -m APPARMOR --start this-month  # AppArmor denials
 ```
 
 ### J.7 Flatpak Auto-Update Timer
@@ -1621,6 +1937,7 @@ fs.inotify.max_user_instances = 1024
 | `safe-upgrade` | Verify → snapshot → upgrade → verify → verdict |
 | `system-health` | System health dashboard |
 | `perf-baseline` | Performance benchmark |
+| `notify-failure` | Desktop notification + log on systemd service failure |
 | `backup-borg` | BorgBackup to external drive |
 | `backup-borg-remote` | BorgBackup to remote SSH server |
 

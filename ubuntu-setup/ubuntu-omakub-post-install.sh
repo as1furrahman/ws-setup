@@ -274,6 +274,9 @@ DNS"
     run "systemctl mask ModemManager.service 2>/dev/null || true"
     run "systemctl disable --now avahi-daemon.service avahi-daemon.socket 2>/dev/null || true"
     run "systemctl mask remote-fs.target 2>/dev/null || true"
+    run "systemctl disable --now apport.service 2>/dev/null || true"
+    run "systemctl mask apport.service"
+    run "systemctl disable --now pcscd.service pcscd.socket 2>/dev/null || true"
 
     sub "E.8 systemd-oomd Tuning"
     run "mkdir -p /etc/systemd/oomd.conf.d"
@@ -317,11 +320,12 @@ TMP"
 COMPRESS=zstd
 RESUME=UUID=${SWAP_UUID:-none}
 INITRD"
+    run "sed -i 's/^MODULES=most/MODULES=dep/' /etc/initramfs-tools/initramfs.conf"
+    run "grep -qxF 'btrfs' /etc/initramfs-tools/modules || echo 'btrfs' >> /etc/initramfs-tools/modules"
     run "update-initramfs -u -k all 2>/dev/null || true"
 
     sub "E.12 Boot Experience"
     run "sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=2/' /etc/default/grub"
-    run "sed -i 's/^GRUB_TERMINAL_OUTPUT=.*/GRUB_TERMINAL_OUTPUT=\"gfxterm\"/' /etc/default/grub 2>/dev/null || true"
     run "update-grub 2>/dev/null || true"
 
     sub "E.13 SSH Hardening"
@@ -441,6 +445,12 @@ AUDIT"
         warn "IPv6 disabled — takes effect after reboot"
     fi
 
+    sub "E.22 USBGuard"
+    run "apt install -y usbguard"
+    run "usbguard generate-policy > /etc/usbguard/rules.conf"
+    run "systemctl enable --now usbguard"
+    ok "USBGuard active — current devices whitelisted"
+
     ok "Phase E complete"
 }
 
@@ -503,10 +513,27 @@ NVME"
     sub "F.11 Battery Charge Threshold"
     if [[ -n "$BAT_DEV" ]]; then
         run "echo $BATTERY_THRESHOLD > /sys/class/power_supply/$BAT_DEV/charge_control_end_threshold 2>/dev/null || warn 'Battery threshold not supported'"
+        run "tee /etc/systemd/system/battery-charge-threshold.service << BATTSVC
+[Unit]
+Description=Set battery charge threshold
+After=multi-user.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+Restart=on-failure
+RestartSec=5
+ExecStart=/bin/bash -c 'echo $BATTERY_THRESHOLD > /sys/class/power_supply/$BAT_DEV/charge_control_end_threshold'
+
+[Install]
+WantedBy=multi-user.target
+BATTSVC"
+        run "systemctl daemon-reload"
+        run "systemctl enable battery-charge-threshold.service"
         run "tee /etc/udev/rules.d/87-battery-threshold.rules << BATT
-ACTION==\"add\", SUBSYSTEM==\"power_supply\", ATTR{type}==\"Battery\", ATTR{charge_control_end_threshold}=\"$BATTERY_THRESHOLD\"
+ACTION==\"change\", SUBSYSTEM==\"power_supply\", ATTR{type}==\"Battery\", ATTR{charge_control_end_threshold}=\"$BATTERY_THRESHOLD\"
 BATT"
-        ok "Battery threshold set to ${BATTERY_THRESHOLD}%"
+        ok "Battery threshold set to ${BATTERY_THRESHOLD}% (persistent via systemd + udev)"
     else
         warn "No battery detected — skipping"
     fi
@@ -522,6 +549,12 @@ BATT"
         run "sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=\"\(.*\)\"/GRUB_CMDLINE_LINUX_DEFAULT=\"\1 processor.max_cstate=9 amd_pstate.shared_mem=1\"/' /etc/default/grub"
         run "update-grub 2>/dev/null || true"
     fi
+
+    sub "F.14 Thermal Baseline"
+    run "sensors-detect --auto 2>/dev/null || true"
+    run "bash -c 'echo \"=== Thermal Baseline \$(date +%Y-%m-%d) ===\" | tee -a /var/log/thermal-baseline.log'"
+    run "bash -c 'sensors 2>/dev/null | grep -iE \"tctl|tdie\" | head -1 | tee -a /var/log/thermal-baseline.log || echo \"No thermal sensors detected\" | tee -a /var/log/thermal-baseline.log'"
+    ok "Thermal baseline logged to /var/log/thermal-baseline.log"
 
     ok "Phase F complete (reboot needed for kernel params)"
 }
@@ -564,12 +597,20 @@ phase_g() {
     run "$GS org.gnome.desktop.privacy recent-files-max-age 7"
     run "$GS org.gnome.desktop.privacy remove-old-temp-files true"
     run "$GS org.gnome.desktop.privacy old-files-age 7"
+    run "$GS org.gnome.desktop.interface enable-hot-corners false"
+    run "$GS org.gnome.desktop.session idle-delay 180"
+    run "$GS org.gnome.desktop.screensaver lock-enabled true"
+    run "$GS org.gnome.desktop.screensaver lock-delay 0"
+    run "$GS org.gnome.software download-updates false"
+    run "$GS org.gnome.software download-updates-notify false"
+    run "$GS org.gnome.desktop.search-providers disabled \"['org.gnome.Software.desktop', 'org.gnome.Characters.desktop', 'org.gnome.clocks.desktop', 'org.gnome.Photos.desktop']\""
 
     sub "G.6 Tracker3"
     run "$GS org.freedesktop.Tracker3.Miner.Files index-recursive-directories \"['&DESKTOP', '&DOCUMENTS', '&PICTURES', '&DOWNLOAD']\""
     run "$GS org.freedesktop.Tracker3.Miner.Files index-on-battery false"
     run "$GS org.freedesktop.Tracker3.Miner.Files index-removable-devices false"
     run "$GS org.freedesktop.Tracker3.Miner.Files crawling-interval -1"
+    run "$GS org.freedesktop.Tracker3.Miner.Files ignored-directories-with-content \"['node_modules', '.venv', '__pycache__', '.git', '.cargo', 'target', '.tox', '.mypy_cache', '.pytest_cache', 'dist', 'build']\""
     run "sudo -u $REAL_USER touch $REAL_HOME/projects/.trackerignore"
 
     sub "G.7 Nautilus Performance"
@@ -588,7 +629,21 @@ phase_h() {
     hdr "Phase H — Development Environment"
 
     sub "H.1 System Packages"
-    run "apt install -y build-essential gcc g++ gfortran make cmake ninja-build meson clang llvm lld python3-dev python3-venv golang libssl-dev libffi-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev libncurses-dev xz-utils tk-dev libblas-dev liblapack-dev libopenblas-dev libhdf5-dev git-lfs btop iotop powertop tmux jq shellcheck strace linux-tools-common linux-tools-generic stress-ng lm-sensors nvme-cli smartmontools btrfs-progs compsize wget curl rsync bc wl-clipboard auditd borgbackup 2>/dev/null || true"
+    run "apt install -y build-essential gcc g++ gfortran make cmake ninja-build meson clang llvm lld python3-dev python3-venv golang libssl-dev libffi-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev libncurses-dev xz-utils tk-dev libblas-dev liblapack-dev libopenblas-dev libhdf5-dev git-lfs btop iotop powertop tmux jq fd-find shellcheck strace linux-tools-common linux-tools-generic stress-ng lm-sensors nvme-cli smartmontools btrfs-progs compsize wget curl rsync bc wl-clipboard auditd borgbackup 2>/dev/null || true"
+
+    info "Installing yq (YAML processor)..."
+    if ! command -v yq &>/dev/null; then
+        YQ_VER=$(curl -s https://api.github.com/repos/mikefarah/yq/releases/latest 2>/dev/null | grep tag_name | cut -d '"' -f 4 || echo "")
+        if [[ -n "$YQ_VER" ]]; then
+            run "wget -qO /usr/local/bin/yq 'https://github.com/mikefarah/yq/releases/download/${YQ_VER}/yq_linux_amd64' 2>/dev/null || true"
+            run "chmod +x /usr/local/bin/yq"
+            ok "yq $YQ_VER installed"
+        else
+            warn "Could not determine yq version — install manually"
+        fi
+    else
+        ok "yq already installed"
+    fi
 
     sub "H.2 Git Configuration Additions"
     # Install delta first
@@ -724,10 +779,19 @@ export ELECTRON_OZONE_PLATFORM_HINT=auto
 export QT_QPA_PLATFORM=wayland
 export MOZ_ENABLE_WAYLAND=1
 
+export GOPATH=\"\$HOME/go\"
+export GOBIN=\"\$HOME/go/bin\"
+export PATH=\"\$GOBIN:\$PATH\"
+
 alias upgrade='sudo /usr/local/bin/safe-upgrade'
 alias health='sudo /usr/local/bin/system-health'
 alias snap='sudo /usr/local/bin/btrfs-snapshot'
 alias top='btop'
+alias cat='bat --plain'
+alias grep='rg'
+alias find='fdfind'
+alias ll='eza -la --group-directories-first --git'
+alias ls='eza --group-directories-first'
 # --- End Ubuntu 24.04 Post-Install ---
 BASHRC"
         ok "Shell config appended to .bashrc"
@@ -837,7 +901,32 @@ case \"\${1:-help}\" in
     verify) echo \"Health check...\"; check_health && echo \"Healthy\" || { echo \"Failed\"; exit 1; } ;;
     list) for d in root home projects; do [ -d \"\$SNAP_ROOT/\$d\" ] || continue; echo \"\$d:\"; ls -1 \"\$SNAP_ROOT/\$d/\"; done ;;
     clean) keep=\${2:-\$MAX}; for d in root home projects; do dir=\"\$SNAP_ROOT/\$d\"; [ -d \"\$dir\" ] || continue; count=\$(find \"\$dir\" -maxdepth 1 -mindepth 1 -type d|wc -l); if [ \"\$count\" -gt \"\$keep\" ]; then find \"\$dir\" -maxdepth 1 -mindepth 1 -type d|sort|head -n \$((count-keep))|while read -r s; do btrfs subvolume delete \"\$s\">/dev/null; echo \"  Deleted: \$(basename \"\$s\")\"; done; fi; done ;;
-    rollback) echo \"Boot Ubuntu Live USB, mount subvolid=5, restore from /.snapshots/\"; last_verified && echo \"Last verified: \$(last_verified)\" ;;
+    rollback)
+        echo \"=== Btrfs Rollback Procedure ===\"
+        echo \"\"
+        echo \"1. Boot Ubuntu 24.04 Live USB\"
+        echo \"2. Open a terminal and become root:\"
+        echo \"   sudo -i\"
+        echo \"3. Mount the top-level Btrfs volume:\"
+        echo \"   mount -o subvolid=5 /dev/nvme0n1p4 /mnt\"
+        echo \"4. Move the broken subvolume aside:\"
+        echo \"   cd /mnt\"
+        echo \"   mv @ @.broken-\\\$(date +%Y%m%d)\"
+        echo \"5. Restore from snapshot (pick one from /.snapshots/root/):\"
+        echo \"   btrfs subvolume snapshot .snapshots/root/<SNAPSHOT> @\"
+        echo \"6. Repeat for @home and @projects if needed:\"
+        echo \"   mv @home @home.broken-\\\$(date +%Y%m%d)\"
+        echo \"   btrfs subvolume snapshot .snapshots/home/<SNAPSHOT> @home\"
+        echo \"7. Unmount and reboot:\"
+        echo \"   cd / && umount /mnt && reboot\"
+        echo \"\"
+        echo \"Available snapshots:\"
+        for d in root home projects; do
+            [ -d \"\$SNAP_ROOT/\$d\" ] || continue
+            echo \"  \$d:\"; ls -1 \"\$SNAP_ROOT/\$d/\" 2>/dev/null | tail -5 | sed 's/^/    /'
+        done
+        last_verified && echo \"\" && echo \"Last verified group: \$(last_verified)\"
+        ;;
     *) echo \"Usage: btrfs-snapshot {pre-upgrade|group|verify|list|clean|rollback}\" ;;
 esac
 SNAPSCRIPT"
@@ -865,42 +954,65 @@ UPGSCRIPT"
     run "tee /usr/local/bin/system-health << 'HEALTHSCRIPT'
 #!/bin/bash
 set -euo pipefail
-echo \"\"; echo \"============================================\"
-echo \"  System Health · \$(date '+%Y-%m-%d %H:%M')\"
-echo \"============================================\"
-echo \"\"; echo \"Kernel & Boot\"
-echo \"  Kernel: \$(uname -r) · Uptime: \$(uptime -p)\"
+
+GRN='\033[0;32m'; RED='\033[0;31m'; YLW='\033[0;33m'
+BLD='\033[1m'; DIM='\033[2m'; RST='\033[0m'
+
+ok()   { echo -e \"  \${GRN}✓\${RST} \$*\"; }
+err()  { echo -e \"  \${RED}✗\${RST} \$*\"; }
+warn() { echo -e \"  \${YLW}!\${RST} \$*\"; }
+hdr()  { echo -e \"\n\${BLD}\$*\${RST}\"; }
+
+echo \"\"
+echo -e \"\${BLD}============================================\${RST}\"
+echo -e \"\${BLD}  System Health · \$(date '+%Y-%m-%d %H:%M')\${RST}\"
+echo -e \"\${BLD}============================================\${RST}\"
+
+hdr \"Kernel & Boot\"
+echo -e \"  Kernel: \$(uname -r) · Uptime: \$(uptime -p)\"
 FAILED=\$(systemctl --failed --no-pager --no-legend|wc -l)
-[ \"\$FAILED\" -eq 0 ] && echo \"  [OK] No failed services\" || echo \"  [!!] \$FAILED failed\"
+[ \"\$FAILED\" -eq 0 ] && ok \"No failed services\" || err \"\$FAILED failed service(s)\"
 AA=\$(aa-status 2>/dev/null|head -1||echo unknown)
-echo \"  AppArmor: \$AA\"
-echo \"\"; echo \"CPU & Thermal\"
-echo \"  Driver: \$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_driver 2>/dev/null) · EPP: \$(cat /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference 2>/dev/null) · Profile: \$(powerprofilesctl get 2>/dev/null)\"
+echo -e \"  AppArmor: \$AA\"
+
+hdr \"CPU & Thermal\"
+echo -e \"  Driver: \$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_driver 2>/dev/null) · EPP: \$(cat /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference 2>/dev/null) · Profile: \$(powerprofilesctl get 2>/dev/null)\"
 if command -v sensors &>/dev/null; then
     T=\$(sensors 2>/dev/null | grep -iE \"tctl|tdie\" | head -1 | sed -n 's/.*+\\([0-9]*\\)\\..*/\\1/p')
-    [ -n \"\$T\" ] && echo \"  CPU Temp: \${T}C\"
+    if [ -n \"\$T\" ]; then
+        [ \"\$T\" -lt 80 ] && ok \"CPU Temp: \${T}C\" || warn \"CPU Temp: \${T}C (high)\"
+    fi
 fi
-echo \"\"; echo \"Memory\"
-echo \"  \$(free -h | awk '/Mem:/{printf \"RAM: %s/%s (%s available)\", \$3, \$2, \$7}')\"
-echo \"\"; echo \"Storage\"
-echo \"  Root: \$(df -h /|awk 'NR==2{print \$5, \"used,\", \$4, \"free\"}')\"
+
+hdr \"Memory\"
+echo -e \"  \$(free -h | awk '/Mem:/{printf \"RAM: %s/%s (%s available)\", \$3, \$2, \$7}')\"
+
+hdr \"Storage\"
+echo -e \"  Root: \$(df -h /|awk 'NR==2{print \$5, \"used,\", \$4, \"free\"}')\"
 if command -v nvme &>/dev/null; then
     WEAR=\$(nvme smart-log /dev/nvme0n1 2>/dev/null | awk '/percentage_used/{print \$3}' | tr -d '%')
-    [ -n \"\$WEAR\" ] && echo \"  SSD wear: \${WEAR}%\"
+    if [ -n \"\$WEAR\" ]; then
+        [ \"\$WEAR\" -lt 80 ] && ok \"SSD wear: \${WEAR}%\" || warn \"SSD wear: \${WEAR}% (consider replacement)\"
+    fi
 fi
 BERR=\$(btrfs device stats / 2>/dev/null|grep -v ' 0\$'|wc -l)
-[ \"\$BERR\" -eq 0 ] && echo \"  [OK] Btrfs: clean\" || echo \"  [!!] Btrfs: \$BERR error(s)\"
+[ \"\$BERR\" -eq 0 ] && ok \"Btrfs: clean\" || err \"Btrfs: \$BERR error(s)\"
+
 BAT=\$(cat /sys/class/power_supply/BAT*/capacity 2>/dev/null|head -1)
 BSTAT=\$(cat /sys/class/power_supply/BAT*/status 2>/dev/null|head -1)
-[ -n \"\$BAT\" ] && { echo \"\"; echo \"Battery\"; echo \"  \${BAT}% (\$BSTAT)\"; }
-echo \"\"; echo \"Snapshots\"
+if [ -n \"\$BAT\" ]; then
+    hdr \"Battery\"
+    [ \"\$BAT\" -gt 20 ] && ok \"\${BAT}% (\$BSTAT)\" || warn \"\${BAT}% (\$BSTAT) — low\"
+fi
+
+hdr \"Snapshots\"
 for d in root home projects; do
     [ -d \"/.snapshots/\$d\" ] || continue
     C=\$(find \"/.snapshots/\$d\" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l)
     L=\$(find \"/.snapshots/\$d\" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort | tail -1 | xargs -r basename 2>/dev/null)
-    echo \"  \$d: \$C snapshot(s)\${L:+, latest: \$L}\"
+    ok \"\$d: \$C snapshot(s)\${L:+, latest: \$L}\"
 done
-echo \"\"; echo \"============================================\"; echo \"\"
+echo -e \"\n\${BLD}============================================\${RST}\n\"
 HEALTHSCRIPT"
     run "chmod +x /usr/local/bin/system-health"
 
@@ -942,6 +1054,40 @@ TMR2"
     run "systemctl enable --now btrfs-snap-weekly.timer btrfs-snap-clean.timer"
     run "systemctl enable --now fstrim.timer"
     run "systemctl enable --now btrfs-scrub@-.timer 2>/dev/null || true"
+
+    sub "I.5 Systemd Failure Alerting"
+    run "tee /etc/systemd/system/notify-failure@.service << 'NFSVC'
+[Unit]
+Description=Service failure notification for %i
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/notify-failure %i
+NFSVC"
+    run "tee /usr/local/bin/notify-failure << 'NFSCRIPT'
+#!/bin/bash
+UNIT=\"\${1:-unknown}\"
+TIMESTAMP=\$(date '+%Y-%m-%d %H:%M:%S')
+MSG=\"FAILED: \$UNIT at \$TIMESTAMP\"
+
+echo \"\$MSG\" >> /var/log/service-failures.log
+
+REAL_USER=\$(logname 2>/dev/null || echo \"\${SUDO_USER:-}\")
+if [ -n \"\$REAL_USER\" ]; then
+    UID_NUM=\$(id -u \"\$REAL_USER\")
+    sudo -u \"\$REAL_USER\" \
+        DISPLAY=:0 \
+        DBUS_SESSION_BUS_ADDRESS=\"unix:path=/run/user/\${UID_NUM}/bus\" \
+        notify-send -u critical \"Service Failed\" \"\$UNIT has failed. Check: journalctl -u \$UNIT\" 2>/dev/null || true
+fi
+NFSCRIPT"
+    run "chmod +x /usr/local/bin/notify-failure"
+    run "touch /var/log/service-failures.log"
+    for unit in fail2ban smartd btrfs-scrub@-.timer chronyd sshd usbguard; do
+        run "if systemctl cat $unit &>/dev/null; then mkdir -p /etc/systemd/system/${unit}.d && printf '[Unit]\nOnFailure=notify-failure@%%n.service\n' > /etc/systemd/system/${unit}.d/failure-alert.conf; fi"
+    done
+    run "systemctl daemon-reload"
+    ok "Failure alerting configured for critical services"
 
     ok "Phase I complete"
 }

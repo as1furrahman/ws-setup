@@ -489,10 +489,27 @@ NVME"
     sub "F.13 Battery Charge Threshold"
     if [[ -n "$BAT_DEV" ]]; then
         run "echo $BATTERY_THRESHOLD > /sys/class/power_supply/$BAT_DEV/charge_control_end_threshold 2>/dev/null || warn 'Battery threshold not supported by this kernel'"
+        run "tee /etc/systemd/system/battery-charge-threshold.service << BATTSVC
+[Unit]
+Description=Set battery charge threshold
+After=multi-user.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+Restart=on-failure
+RestartSec=5
+ExecStart=/bin/bash -c 'echo $BATTERY_THRESHOLD > /sys/class/power_supply/$BAT_DEV/charge_control_end_threshold'
+
+[Install]
+WantedBy=multi-user.target
+BATTSVC"
+        run "systemctl daemon-reload"
+        run "systemctl enable battery-charge-threshold.service"
         run "tee /etc/udev/rules.d/87-battery-threshold.rules << BATT
-ACTION==\"add\", SUBSYSTEM==\"power_supply\", ATTR{type}==\"Battery\", ATTR{charge_control_end_threshold}=\"$BATTERY_THRESHOLD\"
+ACTION==\"change\", SUBSYSTEM==\"power_supply\", ATTR{type}==\"Battery\", ATTR{charge_control_end_threshold}=\"$BATTERY_THRESHOLD\"
 BATT"
-        ok "Battery threshold set to ${BATTERY_THRESHOLD}%"
+        ok "Battery threshold set to ${BATTERY_THRESHOLD}% (persistent via systemd + udev)"
     else
         warn "No battery detected — skipping"
     fi
