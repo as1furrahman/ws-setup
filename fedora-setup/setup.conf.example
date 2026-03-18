@@ -1,0 +1,11 @@
+# Fedora 43 Post-Install Configuration
+# Copy to setup.conf and customize. Use: sudo ./fedora43-post-install.sh --config setup.conf --all
+
+GIT_NAME=Your Name
+GIT_EMAIL=you@example.com
+GPU_SERVER_IP=skip
+GPU_SERVER_USER=test
+BATTERY_THRESHOLD=80
+BORG_LOCAL=/run/media/test/backup-drive/borg-zenbook
+BORG_REMOTE=skip
+DISABLE_IPV6=no
