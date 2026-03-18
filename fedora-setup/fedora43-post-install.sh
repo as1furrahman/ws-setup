@@ -16,9 +16,11 @@
 #   sudo ./fedora43-post-install.sh --non-interactive # use defaults, skip prompts
 #   sudo ./fedora43-post-install.sh --dry-run --all
 #   sudo ./fedora43-post-install.sh --list
+#   sudo ./fedora43-post-install.sh --version
 ###############################################################################
 set -uo pipefail
 
+SCRIPT_VERSION="1.0.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ─── Colors & Output ────────────────────────────────────────────────────────
@@ -41,9 +43,9 @@ CONFIG_FILE=""
 NON_INTERACTIVE=false
 RESUME_MODE=false
 
-# ─── Logging ────────────────────────────────────────────────────────────────
-exec > >(tee -a "$LOG_FILE") 2>&1
-echo "=== Fedora 43 Post-Install · $(date -Is) ===" >> "$LOG_FILE"
+# ─── Progress Counter ───────────────────────────────────────────────────────
+declare -i CURRENT_PHASE=0 TOTAL_PHASES=0
+
 
 # ─── Tracking ───────────────────────────────────────────────────────────────
 declare -i TOTAL_OK=0 TOTAL_SKIP=0 TOTAL_WARN=0 TOTAL_ERR=0
@@ -98,6 +100,7 @@ Options:
   --non-interactive  Use defaults for all prompts, skip interactive prompts
   --dry-run          Show what would be done without executing
   --list             List all available phases
+  --version          Show script version
   --help             Show this help
 EOF
     exit 0
@@ -127,6 +130,7 @@ while [[ $# -gt 0 ]]; do
         --non-interactive)   NON_INTERACTIVE=true; shift ;;
         --dry-run)           DRY_RUN=true; shift ;;
         --list)              list_phases ;;
+        --version)           echo "fedora-setup v${SCRIPT_VERSION}"; exit 0 ;;
         --help|-h)           usage ;;
         *)                   echo "Unknown option: $1"; usage ;;
     esac
@@ -155,6 +159,10 @@ fi
 
 [[ -z "$SELECTED_PHASES" ]] && { echo "Error: specify --all, --phase X,Y, or --resume"; usage; }
 
+# ─── Logging (placed after CLI so --version/--help/--list print directly) ──
+exec > >(tee -a "$LOG_FILE") 2>&1
+echo "=== Fedora 43 Post-Install v${SCRIPT_VERSION} · $(date -Is) ===" >> "$LOG_FILE"
+
 # Phase dependency: e,f,g,h,i,j,k all depend on d
 if ! echo ",$SELECTED_PHASES," | grep -qi ',d,'; then
     for dep_phase in e f g h i j k; do
@@ -168,6 +176,11 @@ fi
 
 should_run() { echo ",$SELECTED_PHASES," | grep -qi ",$1,"; }
 
+# Count selected phases for progress display
+for _p in d e f g h i j k; do
+    should_run "$_p" && ((TOTAL_PHASES++)) || true
+done
+
 run() {
     if $DRY_RUN; then
         echo -e "  ${YEL}[DRY-RUN]${RST} $*"
@@ -176,10 +189,40 @@ run() {
     "$@"
 }
 
+run_or_warn() {
+    if ! run "$@"; then
+        count_warn "Non-fatal: $*"
+    fi
+}
+
+# ─── Network Connectivity Check ────────────────────────────────────────────
+require_network() {
+    if ! curl -sf --max-time 5 --connect-timeout 3 https://fedoraproject.org > /dev/null 2>&1; then
+        count_warn "No internet connectivity — $1 may fail"
+        return 1
+    fi
+    return 0
+}
+
+# ─── Phase Progress ─────────────────────────────────────────────────────────
+phase_hdr() {
+    ((CURRENT_PHASE++)) || true
+    echo -e "\n${BLD}═══ [$CURRENT_PHASE/$TOTAL_PHASES] $1 ═══${RST}\n"
+}
+
 # ─── Root Check ─────────────────────────────────────────────────────────────
 if [[ $EUID -ne 0 ]] && ! $DRY_RUN; then
     echo "Error: This script must be run as root (sudo)."
     echo "  sudo $0 $*"
+    exit 1
+fi
+
+# ─── Concurrent Run Protection ─────────────────────────────────────────────
+LOCK_FILE="/var/lock/fedora-setup.lock"
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    echo "Error: Another instance of fedora-setup is already running."
+    echo "  If this is a mistake, remove $LOCK_FILE and try again."
     exit 1
 fi
 
@@ -471,7 +514,7 @@ fi
 ###############################################################################
 phase_d() {
     phase_timer_start
-    hdr "Phase D — First Boot"
+    phase_hdr "Phase D — First Boot"
 
     sub "D.1 Mount Points & Ownership"
     ensure_user_dir "$REAL_HOME/projects"
@@ -507,6 +550,7 @@ phase_d() {
     fi
 
     sub "D.3 Full System Update"
+    require_network "system update"
     run dnf upgrade -y --refresh
 
     sub "D.4 Firmware Updates"
@@ -517,12 +561,11 @@ phase_d() {
 }
 
 ###############################################################################
-# PHASE E — System Configuration
+# PHASE E — System Configuration (split into logical sub-functions)
 ###############################################################################
-phase_e() {
-    phase_timer_start
-    hdr "Phase E — System Configuration"
 
+# ─── E: System (DNF, RPM Fusion, kernel params, sysctl) ────────────────────
+_phase_e_system() {
     sub "E.1 DNF Configuration"
     ensure_file /etc/dnf/dnf.conf "[main]
 max_parallel_downloads=10
@@ -536,6 +579,7 @@ defaultyes=True
 metadata_expire=172800" || true
 
     sub "E.2 RPM Fusion & Codecs"
+    require_network "RPM Fusion install"
     if ! rpm -q rpmfusion-free-release &>/dev/null; then
         run bash -c 'dnf install -y "https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm"'
         count_ok "RPM Fusion installed"
@@ -614,7 +658,10 @@ kernel.randomize_va_space = 2
 fs.suid_dumpable = 0"; then
         run sysctl --system 2>/dev/null
     fi
+}
 
+# ─── E: Network (DNS, firewall) ───────────────────────────────────────────
+_phase_e_network() {
     sub "E.5 DNS-over-TLS"
     if ensure_file /etc/systemd/resolved.conf.d/performance.conf "[Resolve]
 DNS=1.1.1.1#cloudflare-dns.com 9.9.9.9#dns.quad9.net
@@ -651,7 +698,10 @@ DNSSEC=yes"; then
         fw_changed=true
     fi
     if $fw_changed; then run firewall-cmd --reload 2>/dev/null || true; fi
+}
 
+# ─── E: Services (systemd, oomd, journald, dracut, boot) ──────────────────
+_phase_e_services() {
     sub "E.7 systemd Service Optimization"
     for svc in cups.service cups.socket cups.path cups-browsed.service \
                avahi-daemon.service avahi-daemon.socket \
@@ -712,7 +762,10 @@ install_optional_items+=" /lib/firmware/amdgpu/* /lib/firmware/mediatek/* "'; th
         run grub2-mkconfig -o /boot/grub2/grub.cfg 2>/dev/null || true
         count_ok "GRUB timeout set to 2"
     fi
+}
 
+# ─── E: Security (SSH, fail2ban, USBGuard, chrony, audit) ─────────────────
+_phase_e_security() {
     sub "E.13 SSH Hardening"
     if ensure_file /etc/ssh/sshd_config.d/hardened.conf "PasswordAuthentication no
 PermitRootLogin no
@@ -805,6 +858,17 @@ makestep 1.0 3"; then
             count_warn "IPv6 disabled — takes effect after reboot"
         fi
     fi
+}
+
+# ─── Phase E wrapper (preserves --phase e compatibility) ──────────────────
+phase_e() {
+    phase_timer_start
+    phase_hdr "Phase E — System Configuration"
+
+    _phase_e_system
+    _phase_e_network
+    _phase_e_services
+    _phase_e_security
 
     flush_reload
     phase_timer_end "Phase E" "e"
@@ -815,7 +879,7 @@ makestep 1.0 3"; then
 ###############################################################################
 phase_f() {
     phase_timer_start
-    hdr "Phase F — Hardware-Software Synchronization"
+    phase_hdr "Phase F — Hardware-Software Synchronization"
 
     sub "F.1 Automatic Profile Switching"
     ensure_udev /etc/udev/rules.d/85-power-profile.rules \
@@ -987,7 +1051,7 @@ WantedBy=timers.target"
 ###############################################################################
 phase_g() {
     phase_timer_start
-    hdr "Phase G — OLED Display Optimization"
+    phase_hdr "Phase G — OLED Display Optimization"
 
     sub "G.1 Font Rendering"
     user_gsettings org.gnome.desktop.interface font-antialiasing 'grayscale'
@@ -1013,7 +1077,7 @@ phase_g() {
 ###############################################################################
 phase_h() {
     phase_timer_start
-    hdr "Phase H — GNOME Minimalism"
+    phase_hdr "Phase H — GNOME Minimalism"
 
     sub "H.1 Remove Bloat"
     local bloat_pkgs=()
@@ -1095,9 +1159,10 @@ phase_h() {
 ###############################################################################
 phase_i() {
     phase_timer_start
-    hdr "Phase I — Development Environment"
+    phase_hdr "Phase I — Development Environment"
 
     sub "I.1 System Packages"
+    require_network "development packages"
     if ! dnf group list --installed 2>/dev/null | grep -qi "development.*tools"; then
         run bash -c 'dnf group install -y development-tools c-development 2>/dev/null || dnf group install -y "Development Tools" "C Development Tools and Libraries" 2>/dev/null || true'
         count_ok "Development Tools group"
@@ -1422,7 +1487,7 @@ STAR
 ###############################################################################
 phase_j() {
     phase_timer_start
-    hdr "Phase J — Snapshot Automation and Tools"
+    phase_hdr "Phase J — Snapshot Automation and Tools"
 
     local PROJECTS_MOUNT
     PROJECTS_MOUNT=$(findmnt -n -o TARGET -t btrfs 2>/dev/null | grep '/projects$' | head -1 || echo "$REAL_HOME/projects")
@@ -1431,7 +1496,8 @@ phase_j() {
     local snap_src="$SCRIPT_DIR/scripts/btrfs-snapshot.sh"
     local snap_tmp
     snap_tmp=$(mktemp)
-    sed "s|__PROJECTS_MOUNT__|$PROJECTS_MOUNT|g" "$snap_src" > "$snap_tmp"
+    export __PROJECTS_MOUNT__="$PROJECTS_MOUNT"
+    envsubst '$__PROJECTS_MOUNT__' < "$snap_src" > "$snap_tmp" 2>/dev/null || sed "s|__PROJECTS_MOUNT__|$PROJECTS_MOUNT|g" "$snap_src" > "$snap_tmp"
     ensure_script_content /usr/local/bin/btrfs-snapshot "$(cat "$snap_tmp")"
     rm -f "$snap_tmp"
 
@@ -1496,14 +1562,15 @@ WantedBy=timers.target"
 ###############################################################################
 phase_k() {
     phase_timer_start
-    hdr "Phase K — Backup, Baseline, and Maintenance"
+    phase_hdr "Phase K — Backup, Baseline, and Maintenance"
 
     sub "K.1 BorgBackup Script"
     if [[ "$BORG_LOCAL" != "skip" ]]; then
         local borg_src="$SCRIPT_DIR/scripts/backup-borg.sh"
         local borg_tmp
         borg_tmp=$(mktemp)
-        sed -e "s|__BORG_REPO__|$BORG_LOCAL|g" -e "s|__REAL_USER__|$REAL_USER|g" "$borg_src" > "$borg_tmp"
+        export __BORG_REPO__="$BORG_LOCAL" __REAL_USER__="$REAL_USER"
+        envsubst '$__BORG_REPO__ $__REAL_USER__' < "$borg_src" > "$borg_tmp" 2>/dev/null || sed -e "s|__BORG_REPO__|$BORG_LOCAL|g" -e "s|__REAL_USER__|$REAL_USER|g" "$borg_src" > "$borg_tmp"
         ensure_script_content /usr/local/bin/backup-borg "$(cat "$borg_tmp")"
         rm -f "$borg_tmp"
     fi
@@ -1538,7 +1605,8 @@ WantedBy=timers.target"
         local borg_remote_src="$SCRIPT_DIR/scripts/backup-borg-remote.sh"
         local borg_remote_tmp
         borg_remote_tmp=$(mktemp)
-        sed -e "s|__BORG_REPO__|$BORG_REMOTE|g" -e "s|__REAL_USER__|$REAL_USER|g" "$borg_remote_src" > "$borg_remote_tmp"
+        export __BORG_REPO__="$BORG_REMOTE" __REAL_USER__="$REAL_USER"
+        envsubst '$__BORG_REPO__ $__REAL_USER__' < "$borg_remote_src" > "$borg_remote_tmp" 2>/dev/null || sed -e "s|__BORG_REPO__|$BORG_REMOTE|g" -e "s|__REAL_USER__|$REAL_USER|g" "$borg_remote_src" > "$borg_remote_tmp"
         ensure_script_content /usr/local/bin/backup-borg-remote "$(cat "$borg_remote_tmp")"
         rm -f "$borg_remote_tmp"
 
@@ -1627,7 +1695,7 @@ WantedBy=multi-user.target"
 ###############################################################################
 # MAIN EXECUTION
 ###############################################################################
-hdr "Fedora 43 Post-Installation Script"
+hdr "Fedora 43 Post-Installation Script  v${SCRIPT_VERSION}"
 echo -e "  Phases: ${BLD}${SELECTED_PHASES}${RST}"
 echo -e "  Dry-run: ${BLD}${DRY_RUN}${RST}"
 echo -e "  Log: ${BLD}${LOG_FILE}${RST}"
@@ -1668,6 +1736,42 @@ for t in "${PHASE_TIMES[@]}"; do
 done
 echo -e "    ${BLD}Total: ${SCRIPT_ELAPSED}s${RST}"
 echo ""
+
+# ─── Markdown Summary Report ───────────────────────────────────────────────
+REPORT_FILE="${REAL_HOME}/fedora-setup-report.md"
+if ! $DRY_RUN; then
+    cat > "$REPORT_FILE" <<REPORT
+# Fedora 43 Post-Install Report
+
+**Date:** $(date -Is)
+**Version:** $SCRIPT_VERSION
+**Phases:** $SELECTED_PHASES
+**Duration:** ${SCRIPT_ELAPSED}s
+
+| Metric | Count |
+|---|---|
+| ✓ Applied | $TOTAL_OK |
+| – Skipped | $TOTAL_SKIP |
+| ⚠ Warnings | $TOTAL_WARN |
+| ✗ Errors | $TOTAL_ERR |
+
+## Phase Timing
+
+| Phase | Duration |
+|---|---|
+$(for t in "${PHASE_TIMES[@]}"; do echo "| ${t%%:*} | ${t#*:} |"; done)
+| **Total** | **${SCRIPT_ELAPSED}s** |
+
+## Next Steps
+
+1. Reboot: \`sudo reboot\`
+2. Verify: \`sudo system-health\`
+3. Verify snapshots: \`sudo btrfs-snapshot verify\`
+REPORT
+    chown "$REAL_USER:$REAL_USER" "$REPORT_FILE"
+    info "Report saved to: $REPORT_FILE"
+fi
+
 info "Log saved to: $LOG_FILE"
 info "Reboot to apply kernel parameters and udev rules:"
 echo -e "  ${BLD}sudo reboot${RST}"
@@ -1676,3 +1780,10 @@ info "After reboot, verify with:"
 echo -e "  ${BLD}sudo system-health${RST}"
 echo -e "  ${BLD}sudo btrfs-snapshot verify${RST}"
 echo ""
+
+# ─── Desktop Notification on Completion ────────────────────────────────────
+if ! $DRY_RUN && command -v notify-send &>/dev/null; then
+    sudo -u "$REAL_USER" DISPLAY=:0 DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u "$REAL_USER")/bus" \
+        notify-send -u normal "Fedora Setup Complete" \
+        "✓ $TOTAL_OK applied, ⚠ $TOTAL_WARN warnings, ✗ $TOTAL_ERR errors (${SCRIPT_ELAPSED}s)" 2>/dev/null || true
+fi
